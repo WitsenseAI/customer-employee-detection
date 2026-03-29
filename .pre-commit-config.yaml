@@ -1,0 +1,30 @@
+# Pre-commit hooks — run automatically before every `git commit`
+# Setup (one-time per developer): `uv pip install pre-commit && pre-commit install`
+# Run manually on all files:       `pre-commit run --all-files`
+
+repos:
+  # Ruff: format first, then lint
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.0
+    hooks:
+      - id: ruff-format          # equivalent to `ruff format .`
+      - id: ruff                 # equivalent to `ruff check --fix .`
+        args: [--fix]
+
+  # Mypy: type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        additional_dependencies: []   # add third-party stubs here, e.g. types-requests
+
+  # Basic file hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace  # remove trailing spaces
+      - id: end-of-file-fixer    # ensure files end with a newline
+      - id: check-merge-conflict # block accidental commit of merge conflict markers
+      - id: check-added-large-files
+        args: [--maxkb=500]      # block files > 500 KB (e.g. accidental model weights)
+      - id: detect-private-key   # block accidentally committed private keys

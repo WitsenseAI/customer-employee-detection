@@ -1,0 +1,10 @@
+# Core ML / CV
+ultralytics>=8.0.0          # YOLOv8 — includes TensorRT export support for Jetson
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+Pillow>=9.5.0
+numpy>=1.24.0
+
+# UI
+gradio>=4.0.0
