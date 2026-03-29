@@ -6,13 +6,18 @@ YOLOv8 person detection + two classification modes:
                   no reference images needed, works for any staff member)
 
 Usage:
-    python app.py --device cpu --mode uniform   # supermarket uniform
-    python app.py --device cuda --mode reid     # no uniform, specific people
-    python app.py --device jetson --mode uniform
+    # First: build a colour profile by clicking on employees in a frame
+    python calibrate.py --video footage.mp4 --profile profiles/shop1.json
+
+    # Then: run detection using that profile
+    python app.py --device cpu  --mode uniform --profile profiles/shop1.json
+    python app.py --device cuda --mode reid
+    python app.py --device jetson --mode uniform --profile profiles/shop2.json
 """
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 import cv2
@@ -39,15 +44,21 @@ parser.add_argument(
         "uniform — HSV colour detection (use when staff wear a distinct uniform)"
     ),
 )
+parser.add_argument(
+    "--profile", type=Path, default=None,
+    help="Path to a colour profile JSON built by calibrate.py (uniform mode only)",
+)
 args, _ = parser.parse_known_args()
-DEVICE_ARG = args.device
-MODE       = args.mode
+DEVICE_ARG   = args.device
+MODE         = args.mode
+PROFILE_PATH = args.profile
 
 # Torch device
 TORCH_DEVICE = torch.device(
     "cuda" if (DEVICE_ARG in ("cuda", "jetson") and torch.cuda.is_available()) else "cpu"
 )
-print(f"[Config] --device={DEVICE_ARG}  --mode={MODE}  torch={TORCH_DEVICE}")
+print(f"[Config] --device={DEVICE_ARG}  --mode={MODE}  "
+      f"profile={PROFILE_PATH}  torch={TORCH_DEVICE}")
 
 # ─── YOLOv8 ──────────────────────────────────────────────────────────────────
 
@@ -116,49 +127,68 @@ def is_staff_reid(crop_bgr: np.ndarray) -> bool:
 
 # ─── Mode: uniform — HSV colour detection ────────────────────────────────────
 #
-# Default ranges are tuned for the green (#4a7c3f-ish) + yellow (#d4a017-ish)
-# uniform visible in the supermarket sample image.
-# All values use OpenCV HSV scale: H 0-179, S 0-255, V 0-255.
+# Colour bands are either:
+#   a) Loaded from a JSON profile built by calibrate.py  (recommended)
+#   b) Set manually via the Setup tab sliders            (fallback / fine-tuning)
 #
-# Colour      H (hue)   S (saturation)   V (value/brightness)
-# ──────────  ────────  ───────────────  ────────────────────
-# Green        40 – 85     80 – 255          60 – 255
-# Yellow       18 – 38    100 – 255         130 – 255
+# Each band: { name, h_min, h_max, s_min, v_min }
+# All values: OpenCV HSV scale  H 0-179 | S 0-255 | V 0-255
 
-# Mutable config updated by the Setup tab sliders
-uniform_cfg: dict[str, int] = {
-    "green_h_min":  40,  "green_h_max":  85,
-    "green_s_min":  80,  "green_v_min":  60,
-    "yellow_h_min": 18,  "yellow_h_max": 38,
-    "yellow_s_min": 100, "yellow_v_min": 130,
-    "coverage_pct": 15,   # minimum % of crop pixels that must match uniform
-}
+# Built-in fallback bands (green + yellow supermarket uniform)
+_DEFAULT_BANDS: list[dict] = [
+    {"name": "green",  "h_min": 40, "h_max": 85, "s_min": 80,  "v_min": 60},
+    {"name": "yellow", "h_min": 18, "h_max": 38, "s_min": 100, "v_min": 130},
+]
+
+uniform_bands:    list[dict] = list(_DEFAULT_BANDS)
+uniform_coverage: int        = 15    # % of crop pixels that must match
+
+# Active profile name shown in the UI
+_active_profile: str = "built-in defaults"
+
+
+def load_profile(path: Path) -> str:
+    """Load a colour profile JSON saved by calibrate.py. Returns status string."""
+    global uniform_bands, uniform_coverage, _active_profile
+    if not path.exists():
+        return f"Profile not found: {path}"
+    data              = json.loads(path.read_text())
+    uniform_bands     = data.get("bands", _DEFAULT_BANDS)
+    uniform_coverage  = data.get("coverage_pct", 15)
+    _active_profile   = data.get("name", path.stem)
+    print(f"[uniform] Loaded profile '{_active_profile}' "
+          f"({len(uniform_bands)} band(s)) from {path}")
+    return (f"Profile loaded: '{_active_profile}'  "
+            f"| {len(uniform_bands)} colour band(s)  "
+            f"| coverage ≥ {uniform_coverage}%")
 
 
 def build_uniform_mask(hsv: np.ndarray) -> np.ndarray:
-    """Return a binary mask of pixels matching the configured uniform colours."""
-    cfg = uniform_cfg
-    green_mask = cv2.inRange(
-        hsv,
-        np.array([cfg["green_h_min"],  cfg["green_s_min"],  cfg["green_v_min"]]),
-        np.array([cfg["green_h_max"],  255,                  255]),
-    )
-    yellow_mask = cv2.inRange(
-        hsv,
-        np.array([cfg["yellow_h_min"], cfg["yellow_s_min"], cfg["yellow_v_min"]]),
-        np.array([cfg["yellow_h_max"], 255,                  255]),
-    )
-    return cv2.bitwise_or(green_mask, yellow_mask)
+    """OR-combine masks for every active colour band."""
+    combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for b in uniform_bands:
+        m = cv2.inRange(
+            hsv,
+            np.array([b["h_min"], b["s_min"], b["v_min"]]),
+            np.array([b["h_max"], 255,         255]),
+        )
+        combined = cv2.bitwise_or(combined, m)
+    return combined
 
 
 def is_staff_uniform(crop_bgr: np.ndarray) -> bool:
-    """True if enough of the crop's pixels match the configured uniform colours."""
+    """True if enough crop pixels match any active colour band."""
     if crop_bgr.size == 0:
         return False
     hsv      = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     mask     = build_uniform_mask(hsv)
     coverage = 100.0 * cv2.countNonZero(mask) / mask.size
-    return coverage >= uniform_cfg["coverage_pct"]
+    return coverage >= uniform_coverage
+
+
+# Load profile from CLI if provided
+if PROFILE_PATH and MODE == "uniform":
+    load_profile(PROFILE_PATH)
 
 
 # ─── Unified is_staff dispatcher ─────────────────────────────────────────────
@@ -228,7 +258,7 @@ def reid_save_staff(staff_input: str) -> str:
 
 # ─── Setup: uniform mode ──────────────────────────────────────────────────────
 
-def uniform_preview(
+def uniform_preview(  # kept for internal use only — UI uses _uniform_preview_simple
     green_h_min: int, green_h_max: int, green_s_min: int, green_v_min: int,
     yellow_h_min: int, yellow_h_max: int, yellow_s_min: int, yellow_v_min: int,
     coverage_pct: int,
@@ -388,10 +418,13 @@ with gr.Blocks(title="Staff vs Customer Detector") as demo:
         if MODE == "uniform":
             gr.Markdown(
                 "### Uniform Colour Mode\n"
-                "1. Upload a video and click **Extract Frame**\n"
-                "2. Adjust the HSV sliders until the white overlay covers the uniform\n"
-                "3. Check the **Classification Preview** — all staff should be blue\n"
-                "4. Click **Apply & Save** when satisfied — no reference images needed"
+                "**Recommended:** Run `calibrate.py` once per shop to build a colour profile, "
+                "then load it here.\n"
+                "```\npython calibrate.py --video footage.mp4 --profile profiles/shop1.json\n```\n"
+                "1. Load a saved profile below (or use built-in defaults)\n"
+                "2. Upload a video and click **Extract Frame**\n"
+                "3. Click **Preview Mask** to verify — white pixels should cover uniforms\n"
+                "4. Adjust coverage threshold if needed, then run detection"
             )
         else:
             gr.Markdown(
@@ -414,28 +447,46 @@ with gr.Blocks(title="Staff vs Customer Detector") as demo:
 
         # ── Uniform-mode controls ─────────────────────────────────────────────
         if MODE == "uniform":
-            gr.Markdown("#### Uniform Colour Ranges (OpenCV HSV: H 0-179, S/V 0-255)")
 
+            # ── Profile loader ────────────────────────────────────────────────
+            gr.Markdown("#### Load a Colour Profile (built by calibrate.py)")
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("**Green channel**")
-                    green_h_min = gr.Slider(0,  179, value=40,  step=1, label="Green H min")
-                    green_h_max = gr.Slider(0,  179, value=85,  step=1, label="Green H max")
-                    green_s_min = gr.Slider(0,  255, value=80,  step=5, label="Green S min (saturation)")
-                    green_v_min = gr.Slider(0,  255, value=60,  step=5, label="Green V min (brightness)")
-                with gr.Column():
-                    gr.Markdown("**Yellow channel**")
-                    yellow_h_min = gr.Slider(0,  179, value=18,  step=1, label="Yellow H min")
-                    yellow_h_max = gr.Slider(0,  179, value=38,  step=1, label="Yellow H max")
-                    yellow_s_min = gr.Slider(0,  255, value=100, step=5, label="Yellow S min")
-                    yellow_v_min = gr.Slider(0,  255, value=130, step=5, label="Yellow V min")
-
-            coverage_slider = gr.Slider(
-                1, 60, value=15, step=1,
-                label="Min uniform coverage (% of person crop that must match)",
+                profile_input = gr.Textbox(
+                    label="Profile JSON path",
+                    placeholder="profiles/shop1.json",
+                    value=str(PROFILE_PATH) if PROFILE_PATH else "",
+                    scale=4,
+                )
+                load_profile_btn = gr.Button("Load Profile", scale=1)
+            profile_status = gr.Textbox(
+                label="Active profile",
+                value=f"Profile: {_active_profile}  | {len(uniform_bands)} band(s)"
+                      f" | coverage ≥ {uniform_coverage}%",
+                interactive=False, lines=1,
             )
 
-            preview_btn = gr.Button("Preview Uniform Mask", variant="secondary")
+            def _load_profile_ui(path_str: str) -> str:
+                if not path_str.strip():
+                    return "No path entered."
+                return load_profile(Path(path_str.strip()))
+
+            load_profile_btn.click(_load_profile_ui,
+                                   inputs=profile_input,
+                                   outputs=profile_status)
+
+            gr.Markdown(
+                "---\n"
+                "#### Preview & Fine-tune  \n"
+                "Extract a frame above, then click **Preview** to see how well "
+                "the loaded profile detects the uniform on this footage. "
+                "Adjust coverage threshold if needed."
+            )
+
+            coverage_slider = gr.Slider(
+                1, 60, value=uniform_coverage, step=1,
+                label="Min coverage % (lower = more sensitive, higher = fewer false positives)",
+            )
+            preview_btn = gr.Button("Preview Mask on Frame", variant="secondary")
 
             with gr.Row():
                 mask_img   = gr.Image(label="Colour Mask (white = matched pixels)",
@@ -444,40 +495,47 @@ with gr.Blocks(title="Staff vs Customer Detector") as demo:
                                       type="numpy", height=340)
             preview_msg = gr.Textbox(label="Preview Status", lines=2, interactive=False)
 
-            apply_btn  = gr.Button("✅ Apply & Save Colour Profile", variant="primary")
-            apply_msg  = gr.Textbox(label="Result", lines=1, interactive=False)
+            def _uniform_preview_simple(cov: int) -> tuple:
+                """Preview with current loaded bands + updated coverage threshold."""
+                global uniform_coverage
+                uniform_coverage = cov
+                if _first_frame is None:
+                    return None, None, "Extract a frame first."
+                frame = _first_frame.copy()
+                hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                mask  = build_uniform_mask(hsv)
 
-            preview_btn.click(
-                fn=uniform_preview,
-                inputs=[green_h_min, green_h_max, green_s_min, green_v_min,
-                        yellow_h_min, yellow_h_max, yellow_s_min, yellow_v_min,
-                        coverage_slider],
-                outputs=[mask_img, person_img, preview_msg],
-            )
+                # Mask overlay
+                overlay          = frame.copy()
+                overlay[mask > 0] = [255, 255, 255]
+                mask_preview     = cv2.addWeighted(frame, 0.5, overlay, 0.5, 0)
 
-            def save_uniform_config(
-                gh_min, gh_max, gs_min, gv_min,
-                yh_min, yh_max, ys_min, yv_min, cov,
-            ) -> str:
-                uniform_cfg.update({
-                    "green_h_min": gh_min, "green_h_max": gh_max,
-                    "green_s_min": gs_min, "green_v_min": gv_min,
-                    "yellow_h_min": yh_min, "yellow_h_max": yh_max,
-                    "yellow_s_min": ys_min, "yellow_v_min": yv_min,
-                    "coverage_pct": cov,
-                })
-                return (
-                    f"Colour profile saved — Green H:[{gh_min}-{gh_max}]  "
-                    f"Yellow H:[{yh_min}-{yh_max}]  Coverage≥{cov}%"
+                # Per-person classification
+                person_preview = frame.copy()
+                staff_n = customer_n = 0
+                for (x1, y1, x2, y2), crop in detected_persons:
+                    if is_staff_uniform(crop):
+                        label, color = "Staff",    (200, 60, 0)
+                        staff_n += 1
+                    else:
+                        label, color = "Customer", (0, 180, 50)
+                        customer_n += 1
+                    cv2.rectangle(person_preview, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(person_preview, label, (x1 + 4, y1 + 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+
+                status = (
+                    f"Profile: '{_active_profile}' | "
+                    f"Staff: {staff_n} | Customers: {customer_n} | "
+                    f"Coverage threshold: {cov}%"
                 )
+                return (cv2.cvtColor(mask_preview,   cv2.COLOR_BGR2RGB),
+                        cv2.cvtColor(person_preview, cv2.COLOR_BGR2RGB),
+                        status)
 
-            apply_btn.click(
-                fn=save_uniform_config,
-                inputs=[green_h_min, green_h_max, green_s_min, green_v_min,
-                        yellow_h_min, yellow_h_max, yellow_s_min, yellow_v_min,
-                        coverage_slider],
-                outputs=apply_msg,
-            )
+            preview_btn.click(_uniform_preview_simple,
+                              inputs=coverage_slider,
+                              outputs=[mask_img, person_img, preview_msg])
 
         # ── Reid-mode controls ────────────────────────────────────────────────
         else:
