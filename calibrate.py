@@ -366,11 +366,19 @@ def main() -> None:
     # ── Load frame ────────────────────────────────────────────────────────────
     if args.video:
         cap = cv2.VideoCapture(str(args.video))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, args.frame)
+        if not cap.isOpened():
+            logger.error(f"Could not open video: {args.video}  (file missing or codec unsupported)")
+            return
+        if args.frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, args.frame)
         ret, frame = cap.read()
         cap.release()
         if not ret:
-            logger.error(f"Could not read frame {args.frame} from {args.video}")
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            logger.error(
+                f"Could not read frame {args.frame} from {args.video} "
+                f"(video has {total} frames)"
+            )
             return
         logger.info(f"Loaded frame {args.frame} from {args.video}")
     else:

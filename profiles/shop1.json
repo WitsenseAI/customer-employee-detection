@@ -1,0 +1,21 @@
+{
+  "name": "shop1",
+  "created": "2026-03-29",
+  "bands": [
+    {
+      "name": "green",
+      "h_min": 173,
+      "h_max": 177,
+      "s_min": 21,
+      "v_min": 0
+    },
+    {
+      "name": "yellow",
+      "h_min": 0,
+      "h_max": 84,
+      "s_min": 0,
+      "v_min": 92
+    }
+  ],
+  "coverage_pct": 15
+}
