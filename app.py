@@ -1,354 +1,269 @@
 """
 Staff vs Customer Detection Pipeline
-YOLOv8 person detection + two classification modes:
-  --mode reid     ResNet50 cosine-similarity re-ID (identify specific people)
-  --mode uniform  HSV colour detection (identify by uniform colour — faster,
-                  no reference images needed, works for any staff member)
+=====================================
+Setup tab  : extract one frame, pick staff persons, enter uniform description
+Detection  : YOLOv8 track → classify new IDs with SmolVLM → maintain staff/customer sets
+             Lost tracks are removed from the sets.
+             Counts (= active track IDs in each set) refresh every 10 seconds.
 
 Usage:
-    # First: build a colour profile by clicking on employees in a frame
-    python calibrate.py --video footage.mp4 --profile profiles/shop1.json
-
-    # Then: run detection using that profile
-    python app.py --device cpu  --mode uniform --profile profiles/shop1.json
-    python app.py --device cuda --mode reid
-    python app.py --device jetson --mode uniform --profile profiles/shop2.json
+    python app.py                  # CPU
+    python app.py --device cuda    # GPU
+    python app.py --device jetson  # TensorRT engine if present
 """
 
 import argparse
-import csv
-import json
 from pathlib import Path
 
 import cv2
 import gradio as gr
 import numpy as np
 import torch
-import torch.nn.functional as F
-import torchvision.models as models
-import torchvision.transforms as transforms
 from PIL import Image
+from transformers import Idefics3ForConditionalGeneration, Idefics3Processor
 from ultralytics import YOLO
 
-# ─── CLI args ────────────────────────────────────────────────────────────────
+# ─── Device ───────────────────────────────────────────────────────────────────
 
-parser = argparse.ArgumentParser(description="Staff vs Customer Detector")
-parser.add_argument(
-    "--device", choices=["cpu", "cuda", "jetson"], default="cpu",
-    help="Inference device: cpu | cuda | jetson",
-)
-parser.add_argument(
-    "--mode", choices=["reid", "uniform"], default="uniform",
-    help=(
-        "reid    — ResNet50 cosine similarity against saved staff reference crops\n"
-        "uniform — HSV colour detection (use when staff wear a distinct uniform)"
-    ),
-)
-parser.add_argument(
-    "--profile", type=Path, default=None,
-    help="Path to a colour profile JSON built by calibrate.py (uniform mode only)",
-)
+parser = argparse.ArgumentParser()
+parser.add_argument("--device", choices=["cpu", "cuda", "jetson"], default="cpu")
 args, _ = parser.parse_known_args()
-DEVICE_ARG   = args.device
-MODE         = args.mode
-PROFILE_PATH = args.profile
+DEVICE_ARG = args.device
 
-# Torch device
 TORCH_DEVICE = torch.device(
-    "cuda" if (DEVICE_ARG in ("cuda", "jetson") and torch.cuda.is_available()) else "cpu"
+    "cuda" if DEVICE_ARG in ("cuda", "jetson") and torch.cuda.is_available() else "cpu"
 )
-print(f"[Config] --device={DEVICE_ARG}  --mode={MODE}  "
-      f"profile={PROFILE_PATH}  torch={TORCH_DEVICE}")
+print(f"[Config] device={DEVICE_ARG}  torch={TORCH_DEVICE}")
 
-# ─── YOLOv8 ──────────────────────────────────────────────────────────────────
+# ─── YOLOv8 ───────────────────────────────────────────────────────────────────
 
-YOLO_ENGINE = "yolov8n.engine"
-YOLO_PT     = "yolov8n.pt"
-
-
-def load_yolo() -> YOLO:
-    if DEVICE_ARG == "jetson" and Path(YOLO_ENGINE).exists():
-        print(f"[Jetson] Loading TensorRT engine: {YOLO_ENGINE}")
-        return YOLO(YOLO_ENGINE)
-    if DEVICE_ARG == "jetson":
-        print(f"[Jetson] No .engine found, falling back to {YOLO_PT}")
-    return YOLO(YOLO_PT)
+_ENGINE = "yolov8n.engine"
+_PT     = "yolov8n.pt"
 
 
-yolo_model = load_yolo()
+def _load_yolo() -> YOLO:
+    if DEVICE_ARG == "jetson" and Path(_ENGINE).exists():
+        print(f"[YOLO] Loading TensorRT engine: {_ENGINE}")
+        return YOLO(_ENGINE)
+    return YOLO(_PT)
 
-# ─── Mode: reid — ResNet50 embeddings ────────────────────────────────────────
 
-resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-resnet.fc = torch.nn.Identity()   # strip classifier → 2048-d feature vector
-resnet.eval().to(TORCH_DEVICE)
+yolo_model = _load_yolo()
 
-embed_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+# Detection params used in both tabs
+DETECT_CONF = 0.4   # higher than default (0.25) — filters weak detections
+DETECT_IOU  = 0.4   # lower than default (0.7)  — suppresses overlapping boxes
 
-STAFF_REFS_DIR       = Path("staff_refs")
-SIMILARITY_THRESHOLD = 0.75
+# ─── SmolVLM ──────────────────────────────────────────────────────────────────
+
+_VLM_ID = "HuggingFaceTB/SmolVLM-256M-Instruct"
+print(f"[VLM] Loading {_VLM_ID} …")
+_vlm_proc  = Idefics3Processor.from_pretrained(_VLM_ID)
+_vlm_model = Idefics3ForConditionalGeneration.from_pretrained(
+    _VLM_ID,
+    torch_dtype=torch.float16 if TORCH_DEVICE.type == "cuda" else torch.float32,
+).to(TORCH_DEVICE)
+_vlm_model.eval()
+print("[VLM] Ready.")
+
+# ─── Shared state (written in Setup, read in Detection) ───────────────────────
+
+STAFF_REFS_DIR = Path("staff_refs")
 STAFF_REFS_DIR.mkdir(exist_ok=True)
 
-staff_embeddings: list[tuple[str, torch.Tensor]] = []
+_uniform_description: str = ""          # set during Setup
+_setup_persons: list[tuple[tuple, np.ndarray]] = []   # (bbox, crop) from first frame
 
 
-def get_embedding(crop_bgr: np.ndarray) -> torch.Tensor:
-    pil = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
-    t   = embed_transform(pil).unsqueeze(0).to(TORCH_DEVICE)
-    with torch.no_grad():
-        emb = resnet(t)
-    return F.normalize(emb, dim=1)
+# ─── Tab 1 — Setup ────────────────────────────────────────────────────────────
 
-
-def load_staff_embeddings() -> None:
-    global staff_embeddings
-    staff_embeddings = []
-    for p in sorted(STAFF_REFS_DIR.glob("*.jpg")):
-        crop = cv2.imread(str(p))
-        if crop is not None:
-            staff_embeddings.append((p.stem, get_embedding(crop)))
-    print(f"[reid] Loaded {len(staff_embeddings)} staff embedding(s)")
-
-
-def is_staff_reid(crop_bgr: np.ndarray) -> bool:
-    """True if crop's embedding is close enough to any saved staff reference."""
-    if not staff_embeddings or crop_bgr.size == 0:
-        return False
-    emb = get_embedding(crop_bgr)
-    return any(
-        float((emb * ref).sum()) >= SIMILARITY_THRESHOLD
-        for _, ref in staff_embeddings
-    )
-
-
-# ─── Mode: uniform — HSV colour detection ────────────────────────────────────
-#
-# Colour bands are either:
-#   a) Loaded from a JSON profile built by calibrate.py  (recommended)
-#   b) Set manually via the Setup tab sliders            (fallback / fine-tuning)
-#
-# Each band: { name, h_min, h_max, s_min, v_min }
-# All values: OpenCV HSV scale  H 0-179 | S 0-255 | V 0-255
-
-# Built-in fallback bands (green + yellow supermarket uniform)
-_DEFAULT_BANDS: list[dict] = [
-    {"name": "green",  "h_min": 40, "h_max": 85, "s_min": 80,  "v_min": 60},
-    {"name": "yellow", "h_min": 18, "h_max": 38, "s_min": 100, "v_min": 130},
-]
-
-uniform_bands:    list[dict] = list(_DEFAULT_BANDS)
-uniform_coverage: int        = 15    # % of crop pixels that must match
-
-# Active profile name shown in the UI
-_active_profile: str = "built-in defaults"
-
-
-def load_profile(path: Path) -> str:
-    """Load a colour profile JSON saved by calibrate.py. Returns status string."""
-    global uniform_bands, uniform_coverage, _active_profile
-    if not path.exists():
-        return f"Profile not found: {path}"
-    data              = json.loads(path.read_text())
-    uniform_bands     = data.get("bands", _DEFAULT_BANDS)
-    uniform_coverage  = data.get("coverage_pct", 15)
-    _active_profile   = data.get("name", path.stem)
-    print(f"[uniform] Loaded profile '{_active_profile}' "
-          f"({len(uniform_bands)} band(s)) from {path}")
-    return (f"Profile loaded: '{_active_profile}'  "
-            f"| {len(uniform_bands)} colour band(s)  "
-            f"| coverage ≥ {uniform_coverage}%")
-
-
-def build_uniform_mask(hsv: np.ndarray) -> np.ndarray:
-    """OR-combine masks for every active colour band."""
-    combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    for b in uniform_bands:
-        m = cv2.inRange(
-            hsv,
-            np.array([b["h_min"], b["s_min"], b["v_min"]]),
-            np.array([b["h_max"], 255,         255]),
-        )
-        combined = cv2.bitwise_or(combined, m)
-    return combined
-
-
-def is_staff_uniform(crop_bgr: np.ndarray) -> bool:
-    """True if enough crop pixels match any active colour band."""
-    if crop_bgr.size == 0:
-        return False
-    hsv      = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    mask     = build_uniform_mask(hsv)
-    coverage = 100.0 * cv2.countNonZero(mask) / mask.size
-    return coverage >= uniform_coverage
-
-
-# Load profile from CLI if provided
-if PROFILE_PATH and MODE == "uniform":
-    load_profile(PROFILE_PATH)
-
-
-# ─── Unified is_staff dispatcher ─────────────────────────────────────────────
-
-def is_staff(crop_bgr: np.ndarray) -> bool:
-    return is_staff_uniform(crop_bgr) if MODE == "uniform" else is_staff_reid(crop_bgr)
-
-
-# ─── Shared: first-frame extraction ──────────────────────────────────────────
-
-_first_frame: np.ndarray | None = None   # cached for uniform preview
-detected_persons: list[tuple[tuple[int, int, int, int], np.ndarray]] = []
-
-
-def extract_first_frame(video_path: str | None) -> tuple:
-    """Extract first frame and run YOLOv8 person detection. Returns (annotated_rgb, msg)."""
-    global _first_frame, detected_persons
-    detected_persons = []
-    _first_frame     = None
+def setup_extract_frame(video_path: str | None):
+    """
+    Read the first frame of the uploaded video, run person detection,
+    draw 1-based numbered boxes, return the annotated image and a status message.
+    """
+    global _setup_persons
+    _setup_persons = []
 
     if video_path is None:
-        return None, "Please upload a video file."
+        return None, "Upload a video first."
 
     cap = cv2.VideoCapture(video_path)
     ret, frame = cap.read()
     cap.release()
     if not ret:
-        return None, "Could not read the video file."
+        return None, "Could not read the video."
 
-    _first_frame = frame.copy()
-    results      = yolo_model(frame, classes=[0], verbose=False)[0]
-    annotated    = frame.copy()
+    results   = yolo_model.predict(
+        frame, classes=[0], conf=DETECT_CONF, iou=DETECT_IOU, verbose=False
+    )[0]
+    annotated = frame.copy()
 
     for i, box in enumerate(results.boxes):
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
         crop = frame[y1:y2, x1:x2].copy()
-        detected_persons.append(((x1, y1, x2, y2), crop))
+        _setup_persons.append(((x1, y1, x2, y2), crop))
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 210, 255), 2)
-        cv2.putText(annotated, str(i + 1), (x1 + 4, y1 + 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 210, 255), 2)
+        cv2.putText(
+            annotated, str(i + 1), (x1 + 4, y1 + 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 210, 255), 2,
+        )
 
-    msg = f"Detected {len(detected_persons)} person(s)."
-    return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), msg
+    return (
+        cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+        f"Detected {len(_setup_persons)} person(s). "
+        "Enter the number(s) of staff below, then click Save.",
+    )
 
 
-# ─── Setup: reid mode ─────────────────────────────────────────────────────────
+def setup_save_staff(staff_nums: str, description: str) -> str:
+    """
+    Save the chosen person crops as staff reference images and store
+    the uniform description for use by the VLM during detection.
+    """
+    global _uniform_description
 
-def reid_save_staff(staff_input: str) -> str:
-    if not detected_persons:
-        return "No persons detected yet — extract a frame first."
+    if not _setup_persons:
+        return "Extract a frame first."
+    if not description.strip():
+        return "Enter a uniform description."
+
+    _uniform_description = description.strip()
+
     for f in STAFF_REFS_DIR.glob("*.jpg"):
         f.unlink()
+
     saved = 0
-    for tok in staff_input.split(","):
+    for tok in staff_nums.split(","):
         tok = tok.strip()
         if tok.isdigit():
             idx = int(tok) - 1
-            if 0 <= idx < len(detected_persons):
-                _, crop = detected_persons[idx]
+            if 0 <= idx < len(_setup_persons):
+                _, crop = _setup_persons[idx]
                 cv2.imwrite(str(STAFF_REFS_DIR / f"staff_{idx + 1:03d}.jpg"), crop)
                 saved += 1
-    load_staff_embeddings()
-    return f"Staff profiles saved: {saved} person(s)"
+
+    return f"Saved {saved} staff profile(s).  Uniform: \"{_uniform_description}\""
 
 
-# ─── Setup: uniform mode ──────────────────────────────────────────────────────
+# ─── VLM staff check ──────────────────────────────────────────────────────────
 
-def uniform_preview(  # kept for internal use only — UI uses _uniform_preview_simple
-    green_h_min: int, green_h_max: int, green_s_min: int, green_v_min: int,
-    yellow_h_min: int, yellow_h_max: int, yellow_s_min: int, yellow_v_min: int,
-    coverage_pct: int,
-) -> tuple:
+def _is_staff_vlm(crop_bgr: np.ndarray) -> bool:
     """
-    Update the global uniform config from slider values and return:
-      - annotated frame (uniform pixels highlighted in white overlay)
-      - per-person classification preview with Staff/Customer labels
-      - status message
+    Ask SmolVLM whether the person crop matches the stored uniform description.
+    Crops to the torso region (20 %–75 % of height) before querying.
+    Returns True  → Staff,  False → Customer.
     """
-    # Update global config
-    uniform_cfg.update({
-        "green_h_min":  green_h_min,  "green_h_max":  green_h_max,
-        "green_s_min":  green_s_min,  "green_v_min":  green_v_min,
-        "yellow_h_min": yellow_h_min, "yellow_h_max": yellow_h_max,
-        "yellow_s_min": yellow_s_min, "yellow_v_min": yellow_v_min,
-        "coverage_pct": coverage_pct,
-    })
+    h     = crop_bgr.shape[0]
+    torso = crop_bgr[int(h * 0.20): int(h * 0.75), :]
+    if torso.size == 0:
+        torso = crop_bgr
 
-    if _first_frame is None:
-        return None, None, "Extract a frame first."
+    pil_img  = Image.fromarray(cv2.cvtColor(torso, cv2.COLOR_BGR2RGB))
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image"},
+            {"type": "text",
+             "text": (
+                 f"Is this person wearing {_uniform_description}? "
+                 "Answer only yes or no."
+             )},
+        ],
+    }]
+    prompt = _vlm_proc.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = _vlm_proc(
+        text=prompt, images=[pil_img], return_tensors="pt"
+    ).to(TORCH_DEVICE)
+    with torch.no_grad():
+        out = _vlm_model.generate(**inputs, max_new_tokens=5, do_sample=False)
+    new_toks = out[0][inputs["input_ids"].shape[1]:]
+    answer   = _vlm_proc.decode(new_toks, skip_special_tokens=True).strip().lower()
+    return answer.startswith("yes")
 
-    frame = _first_frame.copy()
-    hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask  = build_uniform_mask(hsv)
 
-    # ── Image 1: full-frame mask overlay (white highlight on matched pixels) ──
-    overlay         = frame.copy()
-    overlay[mask > 0] = [255, 255, 255]
-    mask_preview    = cv2.addWeighted(frame, 0.5, overlay, 0.5, 0)
+# ─── Tab 2 — Detection ────────────────────────────────────────────────────────
 
-    # ── Image 2: per-person classification with current config ────────────────
-    person_preview  = frame.copy()
-    staff_count = customer_count = 0
-    for (x1, y1, x2, y2), crop in detected_persons:
-        if is_staff_uniform(crop):
-            label, color = "Staff",    (200,  60,  0)
-            staff_count += 1
-        else:
-            label, color = "Customer", (0,   180, 50)
-            customer_count += 1
-        cv2.rectangle(person_preview, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(person_preview, label, (x1 + 4, y1 + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+_BLUE  = (255,   0,   0)   # Staff     (blue  in BGR)
+_GREEN = (  0, 180,  50)   # Customer  (green in BGR)
+_GREY  = (150, 150, 150)   # Not yet classified
 
-    status = (
-        f"Uniform mask active. "
-        f"Staff detected: {staff_count} | Customers: {customer_count}\n"
-        f"Adjust sliders if any staff are missed or customers are misclassified."
-    )
+COUNT_INTERVAL_SEC = 10    # recalculate & refresh counts every N seconds
+
+
+def _counts_html(staff: int, customers: int) -> str:
     return (
-        cv2.cvtColor(mask_preview,   cv2.COLOR_BGR2RGB),
-        cv2.cvtColor(person_preview, cv2.COLOR_BGR2RGB),
-        status,
+        "<div style='padding:16px 22px;background:#111827;border-radius:12px;"
+        "color:white;font-size:24px;font-weight:700;line-height:2.2'>"
+        f"<span style='color:#93c5fd'>&#128100;&nbsp;Staff &nbsp;&nbsp;&nbsp;: {staff}</span><br>"
+        f"<span style='color:#6ee7b7'>&#128722;&nbsp;Customers : {customers}</span>"
+        "</div>"
     )
-
-
-# ─── Detection (shared for both modes) ───────────────────────────────────────
-
-BLUE_BGR  = (200,  60,  0)   # Staff label colour
-GREEN_BGR = (  0, 180, 50)   # Customer label colour
 
 
 def run_detection(video_path: str | None):
-    """Generator: streams annotated frames + counts. Writes CSV on completion."""
+    """
+    Generator — yields (annotated_frame, counts_html) for each frame.
+
+    Algorithm
+    ---------
+    • Use model.track(persist=True) so ByteTrack maintains stable IDs.
+    • When a track ID appears for the first time:
+        – call _is_staff_vlm() on its crop
+        – add the ID to staff_set  OR  customer_set
+    • Build current_ids from boxes present in this frame.
+    • Remove any IDs that are no longer visible (track lost) from both sets.
+    • Every COUNT_INTERVAL_SEC seconds recalculate the displayed counts
+      from len(staff_set) and len(customer_set).
+    • Label drawn on each box: "Staff #<id>" or "Customer #<id>" or "#<id>" (pending).
+    """
     if video_path is None:
-        yield None, "Please upload a video file.", None
+        yield None, _counts_html(0, 0)
         return
 
-    if MODE == "reid":
-        load_staff_embeddings()
+    if not _uniform_description:
+        yield None, "<p style='color:red;font-size:18px'>⚠ Complete Setup first.</p>"
+        return
 
-    cap          = cv2.VideoCapture(video_path)
-    fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # Hard-reset ByteTrack so IDs restart from 1 for every new run
+    if yolo_model.predictor is not None:
+        yolo_model.predictor = None
 
-    csv_rows: list[dict]  = []
-    total_staff = total_customers = frame_idx = 0
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    count_every = max(1, int(fps * COUNT_INTERVAL_SEC))
+
+    staff_set:    set[int] = set()   # track IDs of persons currently in frame as staff
+    customer_set: set[int] = set()   # track IDs of persons currently in frame as customer
+    classified:   set[int] = set()   # IDs that have already been through _is_staff_vlm
+
+    last_html = _counts_html(0, 0)
+    frame_idx = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        timestamp = round(frame_idx / fps, 3)
-        frame_staff = frame_customers = 0
-        results   = yolo_model(frame, classes=[0], verbose=False)[0]
-        annotated = frame.copy()
+        results   = yolo_model.track(
+            frame,
+            classes=[0],
+            conf=DETECT_CONF,
+            iou=DETECT_IOU,
+            persist=True,
+            verbose=False,
+        )[0]
+        annotated    = frame.copy()
+        current_ids: set[int] = set()
 
         for box in results.boxes:
+            if box.id is None:
+                continue                      # ByteTrack hasn't committed an ID yet
+            tid = int(box.id)
+            current_ids.add(tid)
+
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
@@ -356,220 +271,121 @@ def run_detection(video_path: str | None):
             if crop.size == 0:
                 continue
 
-            if is_staff(crop):
-                label, color = "Staff",    BLUE_BGR
-                frame_staff += 1
+            # ── Classify on first sight ───────────────────────────────────────
+            if tid not in classified:
+                classified.add(tid)
+                if _is_staff_vlm(crop):
+                    staff_set.add(tid)
+                else:
+                    customer_set.add(tid)
+
+            # ── Draw box + label ──────────────────────────────────────────────
+            if tid in staff_set:
+                label, color = f"Staff #{tid}",    _BLUE
+            elif tid in customer_set:
+                label, color = f"Customer #{tid}", _GREEN
             else:
-                label, color = "Customer", GREEN_BGR
-                frame_customers += 1
+                label, color = f"#{tid}",          _GREY   # classifying…
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(annotated, label, (x1 + 4, y1 + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(
+                annotated, label, (x1 + 4, y1 + 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2,
+            )
 
-        total_staff     += frame_staff
-        total_customers += frame_customers
-        csv_rows.append({
-            "timestamp": timestamp, "frame": frame_idx,
-            "customer_count": frame_customers, "staff_count": frame_staff,
-        })
+        # ── Remove lost tracks ────────────────────────────────────────────────
+        lost = (staff_set | customer_set) - current_ids
+        staff_set    -= lost
+        customer_set -= lost
 
-        yield (
-            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-            f"Frame {frame_idx + 1} / {total_frames}\n"
-            f"Staff (cumulative):    {total_staff}\n"
-            f"Customers (cumulative): {total_customers}",
-            None,
-        )
+        # ── Refresh counts every COUNT_INTERVAL_SEC seconds ───────────────────
+        if frame_idx % count_every == 0:
+            last_html = _counts_html(len(staff_set), len(customer_set))
+
+        yield cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), last_html
         frame_idx += 1
 
     cap.release()
-
-    csv_path = "detection_results.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["timestamp", "frame", "customer_count", "staff_count"])
-        writer.writeheader()
-        writer.writerows(csv_rows)
-
-    yield (
-        None,
-        f"Done — {frame_idx} frames processed.\n"
-        f"Total Staff: {total_staff}  |  Total Customers: {total_customers}\n"
-        f"CSV saved → {csv_path}",
-        csv_path,
-    )
+    # Final update with whatever is left visible in the last frame
+    yield None, _counts_html(len(staff_set), len(customer_set))
 
 
 # ─── Gradio UI ────────────────────────────────────────────────────────────────
 
-MODE_LABEL = "Uniform Colour" if MODE == "uniform" else "Re-ID (ResNet50)"
+with gr.Blocks(title="Staff vs Customer Detector", theme=gr.themes.Soft()) as demo:
 
-with gr.Blocks(title="Staff vs Customer Detector") as demo:
+    gr.Markdown("# Staff vs Customer Detector")
 
-    gr.Markdown(
-        f"# Staff vs Customer Detector\n"
-        f"YOLOv8 · **Mode: {MODE_LABEL}** · Device: **{DEVICE_ARG.upper()}**"
-    )
-
-    # ── Tab 1 ─────────────────────────────────────────────────────────────────
+    # ── Tab 1: Setup ──────────────────────────────────────────────────────────
     with gr.Tab("Setup"):
-
-        if MODE == "uniform":
-            gr.Markdown(
-                "### Uniform Colour Mode\n"
-                "**Recommended:** Run `calibrate.py` once per shop to build a colour profile, "
-                "then load it here.\n"
-                "```\npython calibrate.py --video footage.mp4 --profile profiles/shop1.json\n```\n"
-                "1. Load a saved profile below (or use built-in defaults)\n"
-                "2. Upload a video and click **Extract Frame**\n"
-                "3. Click **Preview Mask** to verify — white pixels should cover uniforms\n"
-                "4. Adjust coverage threshold if needed, then run detection"
-            )
-        else:
-            gr.Markdown(
-                "### Re-ID Mode\n"
-                "1. Upload a video and click **Extract Frame**\n"
-                "2. Note the number on each staff member\n"
-                "3. Type those numbers and click **Save Staff Profiles**"
-            )
-
-        setup_video  = gr.Video(label="CCTV Video", sources=["upload"])
-        extract_btn  = gr.Button("Extract Frame & Detect Persons", variant="primary")
-
-        with gr.Row():
-            setup_image = gr.Image(label="Detected Persons", type="numpy", height=380)
-            setup_msg   = gr.Textbox(label="Status", lines=3, interactive=False)
-
-        extract_btn.click(extract_first_frame,
-                          inputs=setup_video,
-                          outputs=[setup_image, setup_msg])
-
-        # ── Uniform-mode controls ─────────────────────────────────────────────
-        if MODE == "uniform":
-
-            # ── Profile loader ────────────────────────────────────────────────
-            gr.Markdown("#### Load a Colour Profile (built by calibrate.py)")
-            with gr.Row():
-                profile_input = gr.Textbox(
-                    label="Profile JSON path",
-                    placeholder="profiles/shop1.json",
-                    value=str(PROFILE_PATH) if PROFILE_PATH else "",
-                    scale=4,
-                )
-                load_profile_btn = gr.Button("Load Profile", scale=1)
-            profile_status = gr.Textbox(
-                label="Active profile",
-                value=f"Profile: {_active_profile}  | {len(uniform_bands)} band(s)"
-                      f" | coverage ≥ {uniform_coverage}%",
-                interactive=False, lines=1,
-            )
-
-            def _load_profile_ui(path_str: str) -> str:
-                if not path_str.strip():
-                    return "No path entered."
-                return load_profile(Path(path_str.strip()))
-
-            load_profile_btn.click(_load_profile_ui,
-                                   inputs=profile_input,
-                                   outputs=profile_status)
-
-            gr.Markdown(
-                "---\n"
-                "#### Preview & Fine-tune  \n"
-                "Extract a frame above, then click **Preview** to see how well "
-                "the loaded profile detects the uniform on this footage. "
-                "Adjust coverage threshold if needed."
-            )
-
-            coverage_slider = gr.Slider(
-                1, 60, value=uniform_coverage, step=1,
-                label="Min coverage % (lower = more sensitive, higher = fewer false positives)",
-            )
-            preview_btn = gr.Button("Preview Mask on Frame", variant="secondary")
-
-            with gr.Row():
-                mask_img   = gr.Image(label="Colour Mask (white = matched pixels)",
-                                      type="numpy", height=340)
-                person_img = gr.Image(label="Classification Preview",
-                                      type="numpy", height=340)
-            preview_msg = gr.Textbox(label="Preview Status", lines=2, interactive=False)
-
-            def _uniform_preview_simple(cov: int) -> tuple:
-                """Preview with current loaded bands + updated coverage threshold."""
-                global uniform_coverage
-                uniform_coverage = cov
-                if _first_frame is None:
-                    return None, None, "Extract a frame first."
-                frame = _first_frame.copy()
-                hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                mask  = build_uniform_mask(hsv)
-
-                # Mask overlay
-                overlay          = frame.copy()
-                overlay[mask > 0] = [255, 255, 255]
-                mask_preview     = cv2.addWeighted(frame, 0.5, overlay, 0.5, 0)
-
-                # Per-person classification
-                person_preview = frame.copy()
-                staff_n = customer_n = 0
-                for (x1, y1, x2, y2), crop in detected_persons:
-                    if is_staff_uniform(crop):
-                        label, color = "Staff",    (200, 60, 0)
-                        staff_n += 1
-                    else:
-                        label, color = "Customer", (0, 180, 50)
-                        customer_n += 1
-                    cv2.rectangle(person_preview, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(person_preview, label, (x1 + 4, y1 + 22),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
-
-                status = (
-                    f"Profile: '{_active_profile}' | "
-                    f"Staff: {staff_n} | Customers: {customer_n} | "
-                    f"Coverage threshold: {cov}%"
-                )
-                return (cv2.cvtColor(mask_preview,   cv2.COLOR_BGR2RGB),
-                        cv2.cvtColor(person_preview, cv2.COLOR_BGR2RGB),
-                        status)
-
-            preview_btn.click(_uniform_preview_simple,
-                              inputs=coverage_slider,
-                              outputs=[mask_img, person_img, preview_msg])
-
-        # ── Reid-mode controls ────────────────────────────────────────────────
-        else:
-            staff_nums = gr.Textbox(
-                label="Staff Person Numbers (comma-separated)",
-                placeholder="e.g.  2, 3, 5",
-            )
-            save_btn = gr.Button("Save Staff Profiles", variant="secondary")
-            save_msg = gr.Textbox(label="Result", lines=1, interactive=False)
-            save_btn.click(reid_save_staff, inputs=staff_nums, outputs=save_msg)
-
-    # ── Tab 2 ─────────────────────────────────────────────────────────────────
-    with gr.Tab("Run Detection"):
         gr.Markdown(
-            f"Process video frame-by-frame using **{MODE_LABEL}** mode.  \n"
-            "**Staff → blue box** | **Customer → green box**"
+            "**Step 1** Upload the CCTV video  \n"
+            "**Step 2** Click *Extract Frame* — persons are numbered automatically  \n"
+            "**Step 3** Type the number(s) of staff, describe their uniform, click *Save*"
         )
-        det_video  = gr.Video(label="CCTV Video", sources=["upload"])
-        run_btn    = gr.Button("Start Detection", variant="primary")
+
+        setup_video = gr.Video(label="Upload Video", sources=["upload"])
+        extract_btn = gr.Button("Extract Frame & Detect Persons", variant="primary")
 
         with gr.Row():
-            det_image  = gr.Image(label="Live Feed", type="numpy", height=400)
-            det_status = gr.Textbox(label="Running Counts", lines=6, interactive=False)
+            setup_image = gr.Image(
+                label="Detected Persons (numbered)",
+                type="numpy", height=420,
+            )
+            with gr.Column():
+                setup_status = gr.Textbox(
+                    label="Status", lines=2, interactive=False,
+                )
+                staff_nums_box = gr.Textbox(
+                    label="Staff person number(s) — comma-separated",
+                    placeholder="e.g.  2, 4",
+                )
+                uniform_box = gr.Textbox(
+                    label="Uniform description",
+                    placeholder="e.g.  yellow and green t-shirt with dark trousers",
+                    lines=3,
+                )
+                save_btn    = gr.Button("Save Staff Profiles", variant="secondary")
+                save_status = gr.Textbox(label="", lines=1, interactive=False)
 
-        csv_file = gr.File(label="Download Results CSV")
+        extract_btn.click(
+            fn=setup_extract_frame,
+            inputs=setup_video,
+            outputs=[setup_image, setup_status],
+        )
+        save_btn.click(
+            fn=setup_save_staff,
+            inputs=[staff_nums_box, uniform_box],
+            outputs=save_status,
+        )
 
-        run_btn.click(run_detection,
-                      inputs=det_video,
-                      outputs=[det_image, det_status, csv_file])
+    # ── Tab 2: Detection ──────────────────────────────────────────────────────
+    with gr.Tab("Detection"):
+        gr.Markdown(
+            "Upload the video and click **Start Detection**.  \n"
+            "Each tracked person shows their track ID.  "
+            "**Blue = Staff · Green = Customer**  \n"
+            "Counts refresh every 10 seconds and reflect persons currently visible."
+        )
+
+        det_video = gr.Video(label="Upload Video", sources=["upload"])
+        run_btn   = gr.Button("Start Detection", variant="primary", size="lg")
+
+        with gr.Row():
+            live_feed  = gr.Image(
+                label="Live Detection Feed", type="numpy",
+                height=450, show_label=False,
+            )
+            count_box = gr.HTML(_counts_html(0, 0))
+
+        run_btn.click(
+            fn=run_detection,
+            inputs=det_video,
+            outputs=[live_feed, count_box],
+        )
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if MODE == "reid":
-        load_staff_embeddings()
-    print(f"[Ready] Mode={MODE}  Device={DEVICE_ARG}")
+    print(f"[Ready] device={DEVICE_ARG}")
     demo.launch()

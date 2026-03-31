@@ -45,3 +45,9 @@ logs/
 # Runtime folders
 staff_refs/
 detection_results.csv
+*.pt
+*.mp4
+*.json
+Video_Summarization_For_Retail.py
+VideoSumForRetailData.zip
+profiles/*.json

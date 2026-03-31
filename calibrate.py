@@ -44,7 +44,7 @@ SAMPLE_COLOUR = (0, 200, 0)     # green rectangles after confirmed
 OVERLAY_ALPHA = 0.35
 
 MIN_RECT_PX   = 10    # ignore rectangles smaller than 10×10 px
-DEFAULT_COVERAGE = 15  # % of person crop that must match → classify as staff
+DEFAULT_COVERAGE = 25  # % of person torso crop that must match → classify as staff
 
 
 # ─── HSV profile computation ──────────────────────────────────────────────────
